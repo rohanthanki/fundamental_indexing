@@ -1,0 +1,365 @@
+---
+title: "Smart Beta - Fundamental Indexing"
+author: "Rohan Thanki and Anirudh Bhat"
+date: "10/19/2021"
+output: pdf_document
+classoption: a4paper
+
+header-includes:
+  \usepackage{float}
+  \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 10,
+  fig.height = 6,
+  tidy.opts = list(width.cutoff = 100),
+  tidy = TRUE,
+  message = FALSE,
+  warning = FALSE
+  )
+```
+
+# Project Aim
+
+* The objective of this assignment is to construct an equity indices as an alternative to a traditional market capitalization weighted index and compare the performance of these created indices. 
+* These indices are created based on fundamental variables from the financial statements of these firms (available in COMPUSTAT data) and ratios computed from these fundamental variables
+
+# Initial Setup
+
+## Loading libraries
+
+```{r}
+
+# libraries to read and write date to a file
+library(data.table)
+library(readxl)
+library(writexl)
+library(xlsx)
+
+# libraries to fetch data using APIs
+library(fredr)
+
+#libraries to wrangle data and perform analytics
+library(tidyverse)
+library(zoo)
+library(lubridate)
+library(stringr)
+library(ppsr)
+library(moments)
+library(sqldf)
+library(DescTools)
+library(naniar)
+library(PerformanceAnalytics)
+library(tidyquant)
+
+# libraries to plot data
+library(corrplot)
+```
+
+## Declaring Global Variables
+
+```{r}
+# Data path
+data_path = "../Data/"
+
+# add this to a config file instead
+fredr_set_key("7a257e710452eb46c904661109420fe8")
+
+crsp_mkt_cap_threshold = 1000000 # actually this represents 1000 million since shares outstanding are in thousands
+crsp_price_threshold <- 5
+
+# this uses the hard-drive as an extended memory if the RAM is full
+invisible(utils::memory.limit(64000))
+```
+
+* Due to memory constraints, we will only load data of CUSIPS that are common to both CRSP and COMPUSTAT data
+* I have created this list in SAS and saved it as a CSV file
+
+# Data Preparation
+
+## Unique CUSIPS for consideration
+
+```{r}
+# compustat <- fread('data/compustat_funda_filtered.csv')
+# compustat_cusips <- compustat %>%
+#   rename(CUSIP = cusip) %>%
+#   mutate(CUSIP = substr(CUSIP, 1, 8)) %>% 
+#   select(CUSIP) %>% 
+#   unique()
+# 
+# crsp_msf <- fread('data/crsp_msf_filtered.csv')
+# crsp_msf_cusips <- crsp_msf %>%
+#   filter(SHRCD %in% c(10,11)) %>% 
+#   select(CUSIP) %>% 
+#   unique()
+# 
+# common_cusips <- compustat_cusips %>% 
+#   inner_join(crsp_msf_cusips, by = 'CUSIP')
+# 
+# write.csv(common_cusips, 'data/common_cusips.csv', row.names = FALSE)
+```
+
+```{r}
+# Selecting MSFT, AAPL, FORD
+# cusip_ids <- c('59491810', '03783310', '34537086')
+cusip_ids <- fread(paste0(data_path, "common_cusips.csv"))$CUSIP
+```
+
+## COMPUSTAT - Annual Data - Company Fundamentals
+
+* link - `https://www.marketplace.spglobal.com/en/datasets/compustat-fundamentals-(8)#:~:text=Compustat%20Fundamentals%20provides%20standardized%20North,on%20for%20over%2050%20years`
+
+Compustat Fundamentals provides standardized North American and global financial statement and market data for over 80,000 active and inactive publicly traded companies as far back as 1950 and point-in-time snapshots beginning in 1987. The dataset includes:
+
+* over 3,000 standardized annual, quarterly, year-to-date, and semi-annual financial items covering income statement, balance sheet, cash flow, segment (for North American companies), and ratio data
+* Industry specific data covering 12 industries*
+* Daily and monthly market data, including security pricing, dividends, and splits
+* Corporate Tracker providing corporate action and security identifier history
+* Point-in-time snapshot data for North American companies providing all changes to fundamental items and their associated point dates
+
+### Dealing with Look-Ahead Bias
+
+* Here, we need to deal with "look-ahead bias", i.e. we should not form our investment decisions based on information we do not have at that moment of time.
+* Since the COMPUSTAT data has companies whose fiscal years end at different months in the same year, we get the `Year` value from the `fyear` column. We then lag this data by a year to form portfolios for the next calendar year
+* For example - all the financials of companies released in `fiscal year 2001` are used to form portfolios for `calendar year 2002`
+
+```{r}
+compustat <- fread(paste0(data_path, "compustat_funda_filtered.csv"), showProgress = FALSE)
+
+compustat_w <- compustat %>% 
+  select(c('cusip', 'fyear', 'at', 'lct', 'dlc', 'dltt', 'teq', 'oancf', 'ivncf', 'fincf', 'scf', 'ibc', 'xidoc', 'dpc', 'txdc', 'esubc', 'sppiv', 'fopo', 'fsrco', 'exre', 'sale', 'dv', 'capx', 'ivch', 'aqc', 'fuseo', 'sppe', 'siv', 'ivstch', 'ivaco', 'oiadp', 're', 'prcc_f', 'csho', 'lt', 'act', 'ni', 'pi', 'dp')) %>%
+  arrange(cusip, fyear) %>% 
+  mutate(cusip = substr(cusip, 1, 8)) %>%
+  filter(cusip %in% cusip_ids) %>% 
+  filter(!is.null(cusip)) %>%
+  rename(Year = fyear, CUSIP = cusip) %>% 
+  select(CUSIP, Year, everything()) %>%
+  distinct(CUSIP, Year, .keep_all = TRUE) %>%
+  group_by(CUSIP) %>%
+  fill(everything(), .direction = "downup") %>% 
+  mutate(
+    
+    # Lagging the whole time series by 1 year to prevent look-ahead bias
+    Year = lead(Year),
+    
+    # Computing Variables
+    'Net_Assets' = rollapply(at - lct, 5, mean, align='right', fill=NA),
+    'Book_Capitalization' = rollapply(dlc + dltt + teq, 5, mean, align='right', fill=NA),
+    'CFO' = rollapply(oancf, 5, mean, align='right', fill=NA),
+    'CF_Total' = rollapply(oancf + ivncf + fincf, 5, mean, align='right', fill=NA),
+    'Internal_Cash_Flow' = rollapply(case_when(scf %in% c(1,2,3) ~ ibc+xidoc+dpc+txdc+esubc+sppiv+fopo+fsrco,
+                                          scf == 7 ~ ibc+xidoc+dpc+txdc+esubc+sppiv+fopo+exre),
+                                     5, mean, align='right', fill=NA),
+    'Revenue' = rollapply(sale, 5, mean, align='right', fill=NA),
+    'Dividend' = rollapply(dv, 5, mean, align='right', fill=NA),
+    'Investment' = rollapply(case_when(scf %in% c(1,2,3) ~ capx+ivch+aqc+fuseo-sppe-siv,
+                         scf == 7 ~ capx+ivch+aqc-sppe-siv-ivstch-ivaco),
+                         5, mean, align='right', fill=NA),
+    'Profitability' = rollapply(oiadp/((at + lag(at))/2), 5, mean, align='right', fill=NA),
+    'Asset_Turnover' = rollapply(sale/at, 5, mean, align='right', fill=NA),
+    
+    # Compute more fundamental variables
+
+    # Altman Z-score
+    AZ_A = (act-lct)/at,
+    AZ_B = re/at,
+    AZ_C = oiadp/at,
+    AZ_D = (prcc_f*csho)/lt,
+    AZ_E = sale/at,
+    Altman_Z_score = 1.2*AZ_A + 1.4*AZ_B + 3.3*AZ_C + 0.6*AZ_D + 0.99*AZ_E,
+    
+    # Ohlson O-score
+    OHL_A = log(at),
+    OHL_B = lt/at,
+    OHL_C = (act - lct)/at,
+    OHL_D = lct/act,
+    OHL_E = ni/at,
+    OHL_F = (pi+dp)/lt,
+    OHL_G = case_when( lt > at ~ 1, TRUE ~ 0),
+    OHL_H = case_when(ni < 0 & lag(ni) < 0 ~ 1, TRUE ~ 0),
+    OHL_I = ((ni - lag(ni))/(abs(ni) + abs(lag(ni)))),
+    Ohlson_O_score = -1.32 -(0.407*OHL_A) + (6.03*OHL_B) - (1.43*OHL_C) + (0.0757*OHL_D) - (2.37*OHL_E) - (1.83 * OHL_F) - (1.72*OHL_G) + (0.285*OHL_H) - (0.521*OHL_I)
+    ) %>% 
+  
+  # removing intermediate columns
+  select(-at:-dp, -AZ_A:-AZ_E, -OHL_A:-OHL_I)
+
+rm(compustat)
+```
+
+## CRSP Data
+
+* The Center for Research in Security Prices (CRSP) database contains end-of-day and month-end price on primary listings for the NYSE, NYSE MKT, NASDAQ, and Arca exchanges along with basic market indices. 
+* The CRSP_MSF data contains all end-of-month information on stocks from the CRSP over the period 1926 - Dec 2019
+
+### Dealing with Look-Ahead Bias
+
+* Here, we need to deal with "look-ahead bias", i.e. we should not form our investment decisions based on information we do not have at that moment of time.
+* Since we mostly use the CRSP data to `compute returns`, we do not lag the data.
+* However, we do lag the `Market Cap` data by 1 month, since this is used to compute ratios that affect our investment decisions. For example, the `average market cap from December 2000 to November 2001` are used are used to form portfolios for `calendar year 2002`
+* This need not be the case for practical purposes, since market caps can be obtained in real time for most publicly traded stocks. However, since CRSP releases its data with a 1 month lag, we lag the market cap by 1 month in this case.
+
+### Loading and Wrangling MSF Data
+
+```{r}
+# Loading CRSP Monthly Data
+crsp_msf <- fread(paste0(data_path, "crsp_msf_filtered.csv"), showProgress = FALSE) %>%
+  select(CUSIP, DATE, PRC, RET, SHROUT, VWRETD, SHRCD) %>%
+  filter(CUSIP %in% cusip_ids, SHRCD %in% c(10,11))
+
+# Account for Bankrupt Companies
+crsp_msf[crsp_msf$RET == 'B']$RET <- -1
+
+# Wrangling CRSP Monthly Data
+crsp_msf_w <- crsp_msf %>% 
+  rename(Date = DATE) %>%
+  select(Date, everything()) %>%
+  group_by(CUSIP) %>% 
+  fill(everything(), .direction = "downup") %>%  
+  mutate(Date = as.yearmon(ymd(Date)),
+         Year = year(Date),
+         RET = as.numeric(RET),
+         VWRETD = as.numeric(VWRETD),
+         PRC = abs(PRC),
+         MKT_CAP = lag(PRC) * lag(SHROUT),
+    
+    ) %>%
+  distinct(CUSIP, Date, .keep_all = TRUE) %>%
+  drop_na(RET) %>% 
+  select(-PRC,-SHROUT, -SHRCD) %>%
+  select(CUSIP, Date, Year, everything()) %>% 
+  arrange(CUSIP,Date)
+
+rm(crsp_msf)
+```
+
+## Combining COMPUSTAT and CRSP Data
+
+```{r}
+crsp_compustat_combined <- crsp_msf_w %>%
+  inner_join(compustat_w, by = c('CUSIP', 'Year')) %>%
+  select(CUSIP, Year, everything())
+```
+
+## Fama French Factor Returns
+
+* The Fama/French factors are constructed using the 6 value-weight portfolios formed on size and book-to-market.
+* SMB (Small Minus Big) is the average return on the three small portfolios minus the average return on the three big portfolios
+* HML (High Minus Low) is the average return on the two value portfolios minus the average return on the two growth portfolios
+* Rm-Rf, the excess return on the market, value-weight return of all CRSP firms incorporated in the US and listed on the NYSE, AMEX, or NASDAQ that have a CRSP share code of 10 or 11 at the beginning of month t, good shares and price data at the beginning of t, and good return data for t minus the one-month Treasury bill rate (from Ibbotson Associates)
+
+```{r}
+# Fama French Returns Data
+ff_3_factor <- fread(paste0(data_path, "F-F_Research_Data_Factors.csv"), skip = 3) %>%
+  rename(Date = V1,
+         MKT = 'Mkt-RF') %>%
+  mutate(Date = as.yearmon(as.character(Date), "%Y%m"),
+         MKT = MKT / 100,
+         SMB = SMB / 100,
+         HML = HML / 100,
+         RF = RF / 100)
+```
+
+## FRED Data
+
+We extract the following data from the `Federal Reserve Economic Data (FRED)` database. The data we will require is:
+
+1. NBER Recession Data
+  *# This time series is an interpretation of US Business Cycle Expansions and Contractions data provided by The National Bureau of Economic Research (NBER). 
+  * NBER identifies months and quarters of turning points without designating a date within the period that turning points occurred. The dummy variable adopts an arbitrary convention that the turning point occurred at a specific date within the period. 
+  * A value of 1 is a recessionary period, while a value of 0 is an expansionary period.
+  
+2. Kansas City Financial Stress Index (KCFSI)
+  * The Kansas City Financial Stress Index (KCFSI) is a monthly measure of stress in the U.S. financial system based on 11 financial market variables.
+  * A positive value indicates that financial stress is above the long-run average, while a negative value signifies that financial stress is below the long-run average. Another useful way to assess the current level of financial stress is to compare the index to its value during past, widely recognized episodes of financial stress.
+
+```{r}
+# NBER Recession Data
+nber <- fredr(series_id = "USREC") %>%
+  rename(Date = date,
+         USREC = value) %>%
+  mutate(Date = as.yearmon(Date)) %>%
+  select(Date, USREC)
+
+# KCFSI Data
+kcfsi <- fredr(series_id = "KCFSI") %>%
+  rename(Date = date,
+         KCFSI = value) %>%
+  mutate(Date = as.yearmon(Date)) %>%
+  select(Date, KCFSI)
+
+# Merging Data
+fred_data <- nber %>%
+  full_join(kcfsi, by = 'Date')
+```
+
+# Computing Weights of Stock for Each Portfolio
+
+## Check if Stock Exists for Subsequent Year
+
+* Since stocks can get listed anytime in the year, we can only consider them in our portfolios for the subsequent year
+* The `existence_check` dataframe stores the values of the years in which each stock is eligible to be included in our portofolios
+
+```{r}
+existence_check <- crsp_msf_w %>% 
+  mutate(Month = month(Date)) %>% 
+  filter(Month == 12) %>% 
+  select(CUSIP, Year) %>%
+  arrange(CUSIP, Year) %>% 
+  group_by(CUSIP) %>%
+  slice(2:n())
+```
+
+## Computing Yearly Weights Based on Each Fundamental Variable
+
+* While computing weights, we ignore stocks with negative values of factors - so their weights are set to 0
+
+```{r}
+col_sum_divide <- function(x)
+  return(x/sum(x))
+
+compute_weights <- function(df) {
+  weights <- df %>% 
+    mutate(across(c(-CUSIP), col_sum_divide))
+  return(weights)
+}
+
+weights_df <- crsp_compustat_combined %>% 
+  inner_join(existence_check, by=c('CUSIP', 'Year'))
+
+weights_df[weights_df < 0] = 0
+weights_df <- weights_df %>% 
+  mutate_all(function(x) ifelse(!is.finite(x), 0, x)) 
+
+weights_df <- weights_df %>% 
+  select(Year, CUSIP, Net_Assets:Asset_Turnover) %>% 
+  group_by(Year) %>%
+  group_modify(~compute_weights(.))
+
+# For debugging
+# fwrite(weights_df, 'output/weights.csv')
+```
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

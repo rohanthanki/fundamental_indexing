@@ -105,7 +105,7 @@ invisible(utils::memory.limit(64000))
 ```{r}
 # Selecting MSFT, AAPL, FORD
 # cusip_ids <- c('59491810', '03783310', '34537086')
-cusip_ids <- fread(paste0(data_path, "common_cusips.csv"))$CUSIP
+cusip_ids <- fread("../Data/common_cusips.csv")$CUSIP
 ```
 
 ## COMPUSTAT - Annual Data - Company Fundamentals
@@ -253,7 +253,7 @@ crsp_compustat_combined <- crsp_msf_w %>%
 
 ```{r}
 # Fama French Returns Data
-ff_3_factor <- fread(paste0(data_path, "F-F_Research_Data_Factors.csv"), skip = 3) %>%
+ff_3_factor <- fread("../Data/F-F_Research_Data_Factors.csv", skip = 3) %>%
   rename(Date = V1,
          MKT = 'Mkt-RF') %>%
   mutate(Date = as.yearmon(as.character(Date), "%Y%m"),
@@ -315,7 +315,7 @@ existence_check <- crsp_msf_w %>%
 
 ## Computing Yearly Weights Based on Each Fundamental Variable
 
-* While computing weights, we ignore stocks with negative values of factors - so their weights are set to 0
+* While computing weights, we ignore stocks with negative values of ratios - so their weights are set to 0
 
 ```{r}
 col_sum_divide <- function(x)
@@ -343,6 +343,125 @@ weights_df <- weights_df %>%
 # fwrite(weights_df, 'output/weights.csv')
 ```
  
+# Computing Returns for Each Portfolio
+
+## Monthly Returns
+
+### Weighted Return for each Stock for each Month
+
+```{r}
+# Joining the Weights dataframe with the Returns Dataframe
+weighted_returns_df <- weights_df %>% 
+  inner_join(crsp_msf_w[, c('CUSIP', 'Date', 'Year', 'RET', 'VWRETD')], by=c('CUSIP', 'Year')) %>% 
+  ungroup() %>% 
+  select(-Year) %>% 
+  select(Date, CUSIP, RET, VWRETD, everything()) %>% 
+  mutate(across(Net_Assets:Asset_Turnover, ~ .x * RET))
+
+# For debugging
+# fwrite(weighted_returns_df, 'output/weighted_returns.csv')
+```
+
+
+### Monthly Returns for Each Portfolio
+
+```{r}
+# Summing Up the Weighted Returns for each date
+port_ret_df <- weighted_returns_df %>% 
+  group_by(Date) %>% 
+  summarize(across(c('Net_Assets':'Asset_Turnover'),
+                   .f = list(sum = ~ sum(., na.rm = TRUE))))
+```
+
+### Combining Returns 
+
+```{r}
+vwretd <- crsp_msf_w %>%
+  ungroup() %>% 
+  select(Date, VWRETD) %>% 
+  distinct()
+
+returns_df_combined <- port_ret_df %>% 
+   inner_join(vwretd, by=c('Date'))
+
+# Modifying ugly column names
+colnames(returns_df_combined)<-gsub("_sum","",colnames(returns_df_combined))
+
+# Writing the returns to a file
+# fwrite(returns_df_combined, 'output/Monthly_Returns.csv')
+```
+
+# Combining Data for Plotting
+
+## Monthly Returns
+
+```{r}
+plot_df <- returns_df_combined %>% 
+  left_join(ff_3_factor, by = 'Date') %>% 
+  left_join(fred_data, by = 'Date')
+
+fwrite(plot_df, 'output/Plot_Data.csv')
+```
+
+## Annualising Returns
+ 
+```{r}
+returns_df_combined_annualized <- plot_df %>% 
+  select(Date, Net_Assets:RF) %>% 
+  mutate(Year = year(Date)) %>% 
+  select(-Date) %>%
+  group_by(Year) %>% 
+  summarize(across(everything(),
+                   .f = list(annualized = ~ Return.annualized(., scale = 12, geometric = TRUE))))
+
+# Modifying ugly column names
+colnames(returns_df_combined_annualized)<-gsub("_annualized","",colnames(returns_df_combined_annualized))
+
+fwrite(returns_df_combined_annualized, './output/Annualized_Return.csv')
+```
+
+## Cumulative Returns for Each Portfolio from an arbitary Start Year
+
+```{r}
+start_year = 2009
+end_year = 2020
+port_cum_ret_df <- returns_df_combined %>%
+  filter(year(Date) >= start_year) %>%
+  mutate(across(c(-Date), .f = list(cum = function(x) {cumprod(1+x)} )))
+
+# Modifying ugly column names
+port_cum_ret_df <- port_cum_ret_df %>% 
+  select(Date, contains('cum'))
+colnames(port_cum_ret_df)<-gsub("_cum","",colnames(port_cum_ret_df))
+
+# For debugging
+# fwrite(port_cum_ret_df, 'output/Cumulative_Returns.csv')
+```
+
+# Portfolio Performance Evaluation
+
+```{r}
+start_year = 1975
+end_year = 2020
+performance_metrics <- returns_df_combined %>%
+  inner_join(ff_3_factor[, c('Date', 'MKT', 'SMB', 'HML', 'RF')], by = 'Date') %>% 
+  filter(year(Date) >= start_year, year(Date) <= end_year) %>% 
+  pivot_longer(cols = c(Net_Assets:VWRETD),
+               names_to = 'Portfolio',
+               values_to = 'RET') %>% 
+  select(-Date) %>% 
+  group_by(Portfolio) %>% 
+  summarize(across(c(RET),
+                   .f = list(volatility = ~ sd(., na.rm = T) * sqrt(12),
+                             skewness = ~ Skew(., na.rm = T) / (12 ** 1.5),
+                             kurtosis = ~ (Kurt(., na.rm = T) / (12 ** 2)) + 3,
+                             Sharpe_Ratio = ~ mean(. - RF, na.rm=T) / (sd(., na.rm = T) * sqrt(12)),
+                             Information_Ratio = ~ mean(. - MKT, na.rm=T) / (sd(. - MKT, na.rm = T) * sqrt(12)) )))
+
+colnames(performance_metrics)<-gsub("RET_","",colnames(performance_metrics))
+
+fwrite(performance_metrics, './output/Portfolio_Metrics.csv')
+```
 
 
 
